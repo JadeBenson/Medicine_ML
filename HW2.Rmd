@@ -1,0 +1,186 @@
+---
+title: "Homework2"
+author: "Jade Benson"
+date: "10/26/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load-packages, include = FALSE}
+ if (!requireNamespace("BiocManager", quietly = TRUE))
+     install.packages("BiocManager")
+ 
+ BiocManager::install("TCGAbiolinks")
+ BiocManager::install("EDASeq")
+ BiocManager::install("edgeR")
+
+
+library(TCGAbiolinks)
+library(DT)
+library(SummarizedExperiment)
+library(magrittr)
+library(dplyr)
+library(tidyverse)
+library(cluster)
+
+```
+
+##Part 1: Preparation and Exploration##
+
+
+This homework demonstrates how to download, prepare, analyze, and visualize RNA-seq data from the GDC. We begin by querying the API to download all HTSeq -FPKM-UQ data from the 174 patients available. The Fragments Per Kilobase of transcript per Million mapped reads Upper Quartile (FPKM-UQ) is a normalized version of the gene counts that should make comparison and clustering possible. 
+
+
+```{r download_prepare, results = "hide"}
+# set up query to download all HTSeq - FPKM-UQ data that meet our specifications
+query <- GDCquery(
+  project = "TCGA-GBM",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification", 
+  experimental.strategy = "RNA-Seq", 
+  workflow.type = "HTSeq - FPKM-UQ")
+
+#download all cases using the API
+GDCdownload(query, method = "api", files.per.chunk = 20)
+
+#prepare the data for easier browsing
+data <- GDCprepare(query)
+
+```
+
+```{r final_prep}
+#create a dataframe
+meta_df <- as.data.frame(colData(data)) 
+
+#there are 174 patients in this group
+length(meta_df$patient)
+
+#this displays patients and their metadata, only showing 5 in markdown
+datatable(meta_df[1:5,], 
+          options = list(scrollX = TRUE, keys = TRUE, pageLength = 5), 
+          rownames = FALSE)
+
+
+#these are all the genes as rows and patients as columns, values are FPKM-UQ
+#I've condensed this to only show 5 genes for 3 people in the markdown
+assay_DT <- datatable(assay(data), 
+          options = list(scrollX = TRUE, keys = TRUE, pageLength = 5), 
+          rownames = TRUE)
+
+raw_df <- data.frame(assay(data)) %>%
+    rownames_to_column(var = "Genes")
+
+#head(raw_df)
+
+#there are 56,602 genes 
+length(raw_df$Genes)
+```
+
+
+We will now visualize these data by creating 10 histograms (more examined separately) of the distribution of random genes and their counts for all patients. This allows us to get a sense of the size and distribution of different genes which may give us insight into how they could cluster. 
+
+```{r histograms, message = FALSE, warning = FALSE}
+
+#function to create generalized histograms for random genes in the dataset
+histogram_random_gene <- function(gene_patient_df){
+  random_gene <- raw_df[sample(nrow(gene_patient_df), 1), ]
+  random_df <- data.frame(t(random_gene[-1]))
+  colnames(random_df) <- random_gene[, 1]
+  random_df <- random_df%>%
+    rownames_to_column(var = "People")
+
+ggplot(random_df, aes(x=.data[[colnames(random_df)[2]]]))+ 
+  geom_histogram()
+}
+
+#create histograms for 10 genes at a time to see various distributions
+for(i in 1:10){
+  print(histogram_random_gene(raw_df))
+}
+
+```
+
+After visualizing multiple random genes, there are some consistent patterns that emerge. The most commonly occuring frequency among the 174 patients for the vast majority of genes was 0 - not expressed. There are some genes that seem to have bimodal distributions where they are either turned off (0) or there are a very small number of patients when the gene occurs in big concentrations. There are also distributions that look more normal, these tend to occur when the gene is primarily turned on in large amounts (I saw one with ~1,000,000 counts in the majority of patients). The HTSeq - FPKM-UQ values have a wide range in count magnitude. Some genes barely occur over 1,000 times and this spans up to those in the billions. These values are larger than FPKM because they are scaled up to Kilobase and million mapped reads (https://docs.gdc.cancer.gov/Encyclopedia/pages/HTSeq-FPKM-UQ/). 
+
+##Part 2: Dimension reduction and clustering##
+
+Now we can move on to clustering the gene data to see if there are interesting patterns and groups that emerge. Performing this type of clustering might reveal what types of genes and their cancer mutations are similar to each other which could inform future drug development. 
+
+In order to have better defined clusters, we will normalize the gene data. Although FPKM-UQ should be a standardized value, this perhaps redundant normalization step will ensure that all the values are on the same scale within these samples so that the clustering algorithms will function correctly.
+
+```{r norm}
+#These data should be standardized because of FPKM-UQ method, but we will normalize in our sample
+dataNorm <- TCGAanalyze_Normalization(tabDF = assay(data), geneInfo =  geneInfoHT)
+```
+
+I then dropped the bottom quantile of genes, giving a sample size of 42,451. I decided to downsample because so many of the genes (as we saw in the histograms) were largely unexpressed. I still think there is still interesting information to be gained from these cases, but may require separate analysis. I would be interested in later exploring why certain genes have such striking bimodal distributions and what the highly expressed versions mean for those patients with them and whether the patients' attributes or their outcomes differ. For now, we will focus on the genes that are  common and, hopefully because of this, influential and have potential to develop drugs that will affect a large proportion of the population. 
+
+```{r quant}
+#filter top quantile of genes
+dataFilt <- TCGAanalyze_Filtering(tabDF = assay(data),
+                                  method = "quantile", 
+                                  qnt.cut =  0.25)
+
+#number of genes in the dataset, random patient number 
+length(dataFilt[,"TCGA-28-1747-01C-01R-1850-01"])
+
+```
+
+I first performed PCA to see if any clear clusters arose from this dimensionality reduction. I see that the majority of the data is centered and there are some outliers trailing into the corners. The outliers are not as clearly separated into other clusters to make this a more compelling/assuring approach and visualization. 
+```{r pca}
+#run principal component analysis (PCA) on filtered data
+
+pca <- prcomp(t(dataFilt), center=TRUE, scale = TRUE)
+
+#PCA plot
+plot(pca$x)
+
+#plot of explained variance by number of PCs
+#seems really low overall  
+plot(pca$sdev^2/sum(pca$sdev^2), xlab="PC", ylab="Percent of explained variance")
+```
+
+
+I wanted to see if we could find clearer patterns in the gene data by clustering the PCA results using k-means. I first iterated through 50 different values for k to see which one minimized the within cluster variation, so that the clusters would be well-fit (optimization). The sum of squares was very high throughout and continued to decrease with more and more clusters added. Clustering is not very useful if there are only a few patients in each cluster, so I decided to examine two cluster numbers where it looked like there was the steepest drop-offs at 5 and 10 clusters. I prefer the 5 categories because we can clearly see the difference between these groups within the PCA plot where the extreme upper right outlier is its own cluster and the middle points are sensibly broken into a far left, far bottom right, and 2 central groups. The reduction in the between sum of squares (even if not ideal numbers) and the intuitive spatial clustering convinced me that this clustering was valid. I still think that this could be greatly improved upon. 
+
+
+```{r kmeans}
+
+# Find optimal number for k 
+# How does within-cluster variation (sums of squares) reduce over a range of values for k
+wss <- function(k) {
+  kmeans(pca$x, k, nstart = 10)$tot.withinss
+}
+
+tibble(
+  k = 1:50
+) %>%
+  mutate(wss = map_dbl(k, wss)) %>%
+  ggplot(aes(k, wss)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 1:50) +
+  labs(title = "Gene FPKM-UQ Count PCs",
+       x = "Number of clusters K",
+       y = "Total within-clusters sum of squares")
+
+#k-means with 5 categories
+#choose this one!
+kc_5 <- kmeans(pca$x, 5)
+plot(pca$x[,1:2],col=factor(kc_5$cluster))
+
+#k-means with 10 categories
+kc_10 <- kmeans(pca$x, 10)
+plot(pca$x[,1:2],col=factor(kc_10$cluster))
+```
+
+If I were to continue this project or suggest future research steps, I would recommend trying other dimension reduction and clustering methods. Perhaps t-SNE performs better. Or a hierarchical clustering algorithm might allow for more insight into *why* certain patients are being grouped into different clusters, laying the groundwork for deeper exploration into the genetic reasons behind that. I would also suggest exploring what these principal components are capturing about participants' gene make-ups. Are there particular genes that are driving this reduction? I'm still interested in those bimodal distributions and looking into whether/how that's being captured here. Also, there's that one patient that is an outlier in both axises and I think a closer look into why they're like that would be very fruitful. Actually, choosing exemplar patients from each of the 5 clusters and examining/comparing their gene data would allow us to better understand possible biological explanations behind this clustering. 
+
+
+
+I used the biolinks documentation to help with this assignment: https://bioconductor.org/packages/release/bioc/html/TCGAbiolinks.html
+as well as this tutorial: https://www.bioconductor.org/help/course-materials/2016/BioC2016/ConcurrentWorkshops1/Risso/clusterExperiment.html
+ 
